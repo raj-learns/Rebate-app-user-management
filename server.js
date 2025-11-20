@@ -74,11 +74,20 @@ app.post("/google-login", async (req, res) => {
     const existing = await pool.query(findUserQuery, [googleId, email]);
 
     if (existing.rows.length > 0) {
-      console.log("Existing user:", existing.rows[0]);
+      const user = existing.rows[0];
+
+      const profileComplete =
+        user.course &&
+        user.batch &&
+        user.hostel &&
+        user.mess &&
+        user.food_choice;
+
       return res.status(200).json({
         message: "User already exists",
         exists: true,
-        user: existing.rows[0]
+        profileComplete,
+        user
       });
     }
 
@@ -112,6 +121,48 @@ app.post("/google-login", async (req, res) => {
   }
 });
 
+app.post("/update-profile", async (req, res) => {
+  try {
+    const { googleId, course, batch, hostel, mess, food_choice } = req.body;
+
+    if (!googleId) {
+      return res.status(400).json({ success: false, message: "Missing googleId" });
+    }
+
+    const updateQuery = `
+      UPDATE users
+      SET 
+        course = $1,
+        batch = $2,
+        hostel = $3,
+        mess = $4,
+        food_choice = $5
+      WHERE google_id = $6
+      RETURNING *;
+    `;
+
+    const result = await pool.query(updateQuery, [
+      course,
+      batch,
+      hostel,
+      mess,
+      food_choice,
+      googleId
+    ]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({ success: true, user: result.rows[0] });
+
+  } catch (err) {
+    console.error("Profile update error:", err);
+    return res.status(500).json({ success: false });
+  }
+});
+
+
 
 // ---------------------------------------------------------
 // Simple Test Route
@@ -124,7 +175,6 @@ app.get("/all-users", (req, res) => {
   res.json({ users });
 });
 
-// Start server
 app.listen(3000, "0.0.0.0", () =>
   console.log("🚀 Server running on port 3000")
 );
