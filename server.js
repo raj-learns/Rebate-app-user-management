@@ -1,92 +1,232 @@
 const express = require("express");
-const dotenv = require("dotenv");
 const cors = require("cors");
 const session = require("express-session");
-
-dotenv.config();
+const pool = require("./db");
+const multer = require("multer");
+const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
-const allowedOrigins = [
-  "http://localhost:5173"
-];
 
-app.use(cors({
-  origin: allowedOrigins,
-  credentials: true,
-}));
+/* -------------------------------------------
+   CLOUDINARY CONFIG
+--------------------------------------------*/
+cloudinary.config({
+  cloud_name: "dppmsegnz",
+  api_key:    "431821864442837",
+  api_secret: "Q3vViNV7-48cSIMOC5GaRmelr8c"
+});
 
-app.use(express.json());
-app.use(session({ secret: "secret", resave: false, saveUninitialized: true }));
+/* -------------------------------------------
+   MULTER (Memory storage, sending buffer)
+--------------------------------------------*/
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 2MB
+});
 
-// 🚀 Local array to store users temporarily
-let users = [];
 
-// google-login-via-firebase
-// google-login-via-firebase
-app.post("/google-login", (req, res) => {
+/* -------------------------------------------
+   CORS
+--------------------------------------------*/
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+/* -------------------------------------------
+   BODY PARSERS
+--------------------------------------------*/
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+/* -------------------------------------------
+   SESSION
+--------------------------------------------*/
+app.use(
+  session({
+    secret: "secret",
+    resave: false,
+    saveUninitialized: true,
+    cookie: { secure: false, httpOnly: true, sameSite: "lax" },
+  })
+);
+
+
+/* -------------------------------------------
+   GOOGLE LOGIN
+--------------------------------------------*/
+app.post("/google-login", async (req, res) => {
   try {
-    // DEBUG: log the incoming body to inspect what's being sent
-    console.log("Incoming /google-login body:", req.body);
+    const body = req.body.user || req.body;
 
-    let { googleId, name, email } = req.body || {};
-
-    // Normalize/trim values
-    if (googleId && typeof googleId !== "string") googleId = String(googleId);
-    if (googleId) googleId = googleId.trim();
-    if (email && typeof email === "string") email = email.trim().toLowerCase();
-    if (name && typeof name === "string") name = name.trim();
+    const googleId = (body.googleId || body.uid || "").toString().trim();
+    const email = (body.email || "").trim().toLowerCase();
+    const name = (body.name || body.displayName || "").trim();
+    const entry_no = email ? email.split("@")[0] : null;
+// after successful /google-login response
+//localStorage.setItem("googleId", res.data.user.google_id);
 
     if (!googleId || !name || !email) {
-      console.log("Missing fields:", { googleId, name, email });
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // 🔍 Find user by googleId first, then by email as fallback
-    let user = users.find((u) => {
-      if (!u) return false;
-      // normalize stored user fields for safe comparison
-      const storedGoogleId = (u.googleId || "").toString().trim();
-      const storedEmail = (u.email || "").toString().trim().toLowerCase();
-      return storedGoogleId === googleId || storedEmail === email;
-    });
+    // CHECK USER EXISTS
+    const existing = await pool.query(
+      `SELECT * FROM users WHERE google_id = $1 OR email = $2 LIMIT 1`,
+      [googleId, email]
+    );
 
-    console.log("Found user:", user);
+    if (existing.rows.length > 0) {
+      const user = existing.rows[0];
 
-    if (!user) {
-      // generate unique username
-      const base = name.toLowerCase().replace(/\s+/g, "");
-      let username = base;
-      let suffix = 0;
+      const profileComplete =
+        user.course &&
+        user.batch &&
+        user.hostel &&
+        user.mess &&
+        user.food_choice;
 
-      while (users.find((u) => (u.username || "") === username)) {
-        suffix++;
-        username = `${base}${suffix}`;
-      }
-
-      // Create user object
-      user = {
-        googleId,
-        name,
-        email,
-        username,
-      };
-
-      // Store in local memory array
-      users.push(user);
-      console.log("New user created:", user);
-      console.log("All users:", users);
-    } else {
-      console.log("Returning existing user.");
+      return res.json({
+        message: "User already exists",
+        exists: true,
+        profileComplete,
+        user,
+      });
     }
 
-    return res.status(200).json({
-      message: "User authenticated",
-      user,
+    // INSERT NEW USER
+    const insert = await pool.query(
+      `INSERT INTO users (google_id, name, email, entry_no, status)
+       VALUES ($1, $2, $3, $4, 'pending')
+       RETURNING *`,
+      [googleId, name, email, entry_no]
+    );
+
+    return res.status(201).json({
+      message: "New user created",
+      exists: false,
+      user: insert.rows[0],
     });
   } catch (error) {
     console.error("Google Login Error:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
-console.log(users)
-app.listen(3000, "0.0.0.0", () => console.log("🚀 Server running on port 3000"));
+
+
+/* -------------------------------------------
+   UPDATE PROFILE (WITH IMAGE)
+--------------------------------------------*/
+app.post("/update-profile", upload.single("avatar"), async (req, res) => {
+  try {
+    const {
+      googleId,
+      course,
+      batch,
+      hostel,
+      mess,
+      food_choice,
+    } = req.body;
+
+    if (!googleId) {
+      return res.status(400).json({ success: false, message: "Missing googleId" });
+    }
+
+    let avatarUrl = null;
+
+    // IMAGE UPLOAD (if file exists)
+    if (req.file) {
+      const b64 = req.file.buffer.toString("base64");
+      const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+
+      const uploadRes = await cloudinary.uploader.upload(dataURI, {
+        folder: "campus-portal/avatars",
+        public_id: `user_${googleId}`,
+        overwrite: true,
+      });
+
+      avatarUrl = uploadRes.secure_url;
+    }
+
+    // UPDATE USER
+    const updateQuery = `
+      UPDATE users
+      SET 
+        course = $1::course_enum,
+        batch = $2::batch_enum,
+        hostel = $3::hostel_enum,
+        mess = $4::mess_enum,
+        food_choice = $5::food_enum,
+        avatar_url = COALESCE($6, avatar_url),
+        status = 'pending'::user_status_enum
+      WHERE google_id = $7
+      RETURNING *;
+    `;
+
+    const values = [
+      course,
+      batch,
+      hostel,
+      mess,
+      food_choice,
+      avatarUrl,
+      googleId,
+    ];
+
+    const result = await pool.query(updateQuery, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({ success: true, user: result.rows[0] });
+
+  } catch (err) {
+    console.error("Profile update error:", err);
+    return res.status(500).json({ success: false });
+  }
+});
+
+app.get("/user/:googleId", async (req, res) => {
+  try {
+    const { googleId } = req.params;
+
+    if (!googleId) {
+      return res.status(400).json({ success: false, message: "Missing googleId" });
+    }
+
+    const result = await pool.query(
+      `SELECT * FROM users WHERE google_id = $1 LIMIT 1`,
+      [googleId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error("Get user error:", err);
+    return res.status(500).json({ success: false });
+  }
+});
+
+
+/* -------------------------------------------
+   TEST ROUTES
+--------------------------------------------*/
+app.get("/test", (req, res) => {
+  res.json({ message: "CORS OK" });
+});
+
+
+/* -------------------------------------------
+   START SERVER
+--------------------------------------------*/
+app.listen(3000, "0.0.0.0", () =>
+  console.log("🚀 Server running on port 3000")
+);
